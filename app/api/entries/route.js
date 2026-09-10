@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { getDb } from "@/lib/mongodb";
-import { emptySlots } from "@/lib/slots";
+import { emptySlots, normalizeEntrySlots } from "@/lib/slots";
 
 export const dynamic = "force-dynamic";
 
@@ -16,7 +16,7 @@ export async function GET(req) {
   if (!entry) {
     return NextResponse.json({ memberId, date, slots: emptySlots(), extraHours: "", extraWork: "", saved: false });
   }
-  return NextResponse.json({ ...entry, _id: String(entry._id), saved: true });
+  return NextResponse.json({ ...entry, _id: String(entry._id), slots: normalizeEntrySlots(entry.slots), saved: true });
 }
 
 export async function POST(req) {

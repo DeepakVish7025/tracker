@@ -2,7 +2,10 @@
 
 import { useEffect, useState, use } from "react";
 import Link from "next/link";
-import { SLOTS, emptySlots, todayStr, prettyDate } from "@/lib/slots";
+import {
+  SLOTS, MIN_TASKS, emptySlots, normalizeEntrySlots,
+  todayStr, prettyDate,
+} from "@/lib/slots";
 
 export default function MemberPage({ params }) {
   const { id } = use(params);
@@ -13,7 +16,7 @@ export default function MemberPage({ params }) {
   const [extraWork, setExtraWork] = useState("");
   const [saving, setSaving] = useState(false);
   const [loading, setLoading] = useState(true);
-  const [submitted, setSubmitted] = useState(false); // form closed after save
+  const [submitted, setSubmitted] = useState(false);
   const [popup, setPopup] = useState(false);
   const [error, setError] = useState("");
 
@@ -30,9 +33,7 @@ export default function MemberPage({ params }) {
     fetch(`/api/entries?memberId=${id}&date=${date}`)
       .then((r) => r.json())
       .then((e) => {
-        const base = emptySlots();
-        const incoming = e.slots || [];
-        setSlots(base.map((s) => ({ ...s, ...(incoming.find((x) => x.id === s.id) || {}) })));
+        setSlots(normalizeEntrySlots(e.slots));
         setExtraHours(e.extraHours || "");
         setExtraWork(e.extraWork || "");
         setSubmitted(!!e.saved);
@@ -40,8 +41,18 @@ export default function MemberPage({ params }) {
       });
   }, [id, date]);
 
-  const upd = (sid, field, value) =>
-    setSlots((prev) => prev.map((s) => (s.id === sid ? { ...s, [field]: value } : s)));
+  const patchSlot = (sid, fn) =>
+    setSlots((prev) => prev.map((s) => (s.id === sid ? fn(s) : s)));
+
+  const setTask = (sid, i, value) =>
+    patchSlot(sid, (s) => ({ ...s, tasks: s.tasks.map((t, k) => (k === i ? value : t)) }));
+
+  const addTask = (sid) => patchSlot(sid, (s) => ({ ...s, tasks: [...s.tasks, ""] }));
+
+  const removeTask = (sid, i) =>
+    patchSlot(sid, (s) => ({ ...s, tasks: s.tasks.filter((_, k) => k !== i) }));
+
+  const setBlockage = (sid, value) => patchSlot(sid, (s) => ({ ...s, blockage: value }));
 
   const save = async () => {
     setSaving(true);
@@ -57,8 +68,8 @@ export default function MemberPage({ params }) {
     });
     setSaving(false);
     if (r.ok) {
-      setSubmitted(true);   // close the form
-      setPopup(true);       // show saved popup
+      setSubmitted(true);
+      setPopup(true);
       window.scrollTo({ top: 0, behavior: "smooth" });
     } else {
       setError("Save failed. Please check your connection and try again.");
@@ -72,8 +83,9 @@ export default function MemberPage({ params }) {
     return () => clearTimeout(t);
   }, [popup]);
 
-  const filledSlots = slots.filter((s) => s.task1 || s.task2).length;
-  const blockages = slots.filter((s) => s.blockage).length;
+  const totalTasks = slots.reduce((n, s) => n + s.tasks.filter((t) => t.trim()).length, 0);
+  const filledSlots = slots.filter((s) => s.tasks.some((t) => t.trim())).length;
+  const blockages = slots.filter((s) => s.blockage.trim()).length;
 
   return (
     <>
@@ -106,20 +118,12 @@ export default function MemberPage({ params }) {
           <h2>Sheet submitted for {prettyDate(date)}</h2>
           <p className="note">Your entry is saved in the team database.</p>
           <div className="summary">
-            <div>
-              <div className="big">{filledSlots}</div>
-              <div className="lbl">Slots filled</div>
-            </div>
-            <div>
-              <div className="big">{blockages}</div>
-              <div className="lbl">Blockages</div>
-            </div>
-            <div>
-              <div className="big">{extraHours || "0"}</div>
-              <div className="lbl">Extra hours</div>
-            </div>
+            <div><div className="big">{totalTasks}</div><div className="lbl">Tasks</div></div>
+            <div><div className="big">{filledSlots}</div><div className="lbl">Slots filled</div></div>
+            <div><div className="big">{blockages}</div><div className="lbl">Blockages</div></div>
+            <div><div className="big">{extraHours || "0"}</div><div className="lbl">Extra hours</div></div>
           </div>
-          <div style={{ display: "flex", gap: 10, justifyContent: "center", flexWrap: "wrap" }}>
+          <div className="btnrow">
             <button className="btn-ghost" onClick={() => setSubmitted(false)}>Edit this sheet</button>
             <Link href="/" className="btn">Back to Dashboard</Link>
           </div>
@@ -127,7 +131,8 @@ export default function MemberPage({ params }) {
       ) : (
         <>
           {SLOTS.map((s) => {
-            const v = slots.find((x) => x.id === s.id) || {};
+            const v = slots.find((x) => x.id === s.id);
+            if (!v) return null;
             return (
               <div key={s.id} className={`slot${s.lunch ? " lunch" : ""}`}>
                 <div className="slot-head">
@@ -135,17 +140,31 @@ export default function MemberPage({ params }) {
                   <span className={`pill${s.lunch ? " lunchpill" : ""}`}>{s.lunch ? "Break" : "Work Slot"}</span>
                 </div>
                 <div className="slot-body">
+                  {v.tasks.map((t, i) => (
+                    <div className="taskline" key={i}>
+                      <div style={{ flex: 1, minWidth: 0 }}>
+                        <label>Task {i + 1}</label>
+                        <input
+                          value={t}
+                          onChange={(e) => setTask(s.id, i, e.target.value)}
+                          placeholder={i === 0 ? "What did you work on?" : "Another task in this slot"}
+                        />
+                      </div>
+                      {v.tasks.length > MIN_TASKS && (
+                        <button type="button" className="x-btn" title="Remove this task"
+                          onClick={() => removeTask(s.id, i)}>&times;</button>
+                      )}
+                    </div>
+                  ))}
+
+                  <button type="button" className="add-task" onClick={() => addTask(s.id)}>
+                    + Add task
+                  </button>
+
                   <div>
-                    <label>Task 1</label>
-                    <input value={v.task1 || ""} onChange={(e) => upd(s.id, "task1", e.target.value)} placeholder="What did you work on?" />
-                  </div>
-                  <div>
-                    <label>Task 2</label>
-                    <input value={v.task2 || ""} onChange={(e) => upd(s.id, "task2", e.target.value)} placeholder="Second task (if any)" />
-                  </div>
-                  <div className="full">
                     <label>Blockage / Reason (if work not done)</label>
-                    <input value={v.blockage || ""} onChange={(e) => upd(s.id, "blockage", e.target.value)} placeholder="Kaam nahi hua to kya wajah thi?" />
+                    <input value={v.blockage} onChange={(e) => setBlockage(s.id, e.target.value)}
+                      placeholder="Kaam nahi hua to kya wajah thi?" />
                   </div>
                 </div>
               </div>
@@ -162,12 +181,13 @@ export default function MemberPage({ params }) {
               </div>
               <div>
                 <label>Kya extra work kiya</label>
-                <input value={extraWork} onChange={(e) => setExtraWork(e.target.value)} placeholder="Describe the extra work done" />
+                <input value={extraWork} onChange={(e) => setExtraWork(e.target.value)}
+                  placeholder="Describe the extra work done" />
               </div>
             </div>
           </div>
 
-          <div className="card card-head" style={{ marginBottom: 0 }}>
+          <div className="card save-bar">
             <span className="note" style={{ color: error ? "var(--danger)" : "var(--muted)" }}>
               {error || "Sheet save hone ke baad form band ho jayega."}
             </span>
@@ -183,9 +203,7 @@ export default function MemberPage({ params }) {
           <div className="modal" onClick={(e) => e.stopPropagation()}>
             <div className="tick">&#10003;</div>
             <h3>Saved successfully</h3>
-            <p>
-              {member?.name}&rsquo;s sheet for <strong>{prettyDate(date)}</strong> has been saved.
-            </p>
+            <p>Sheet for <strong>{prettyDate(date)}</strong> has been saved.</p>
             <div className="actions">
               <button className="btn-ghost" onClick={() => setPopup(false)}>Close</button>
               <Link href="/" className="btn">Back to Dashboard</Link>
