@@ -3,9 +3,22 @@
 import { useEffect, useState, use } from "react";
 import Link from "next/link";
 import {
-  SLOTS, MIN_TASKS, emptySlots, normalizeEntrySlots,
+  SLOTS, LUNCH_IDS, MIN_TASKS, emptySlots, normalizeEntrySlots,
   todayStr, prettyDate,
 } from "@/lib/slots";
+import { initials, avatarColor } from "@/lib/people";
+
+// "Slot 1..4" numbering that skips the lunch break.
+const WORK_NO = Object.fromEntries(SLOTS.filter((s) => !s.lunch).map((s, i) => [s.id, i + 1]));
+
+function Check({ size = 30 }) {
+  return (
+    <svg viewBox="0 0 24 24" width={size} height={size} aria-hidden="true">
+      <path d="M5 12.5l4.2 4.2L19 7" fill="none" stroke="currentColor" strokeWidth="2.6"
+        strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  );
+}
 
 export default function MemberPage({ params }) {
   const { id } = use(params);
@@ -57,17 +70,22 @@ export default function MemberPage({ params }) {
   const save = async () => {
     setSaving(true);
     setError("");
+    // Lunch has no inputs; make sure nothing stale is stored against it.
+    const clean = slots.map((s) =>
+      LUNCH_IDS.has(s.id) ? { ...s, tasks: Array(MIN_TASKS).fill(""), blockage: "" } : s
+    );
     const r = await fetch("/api/entries", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         memberId: id,
         memberName: member?.name || "",
-        date, slots, extraHours, extraWork,
+        date, slots: clean, extraHours, extraWork,
       }),
     });
     setSaving(false);
     if (r.ok) {
+      setSlots(clean);
       setSubmitted(true);
       setPopup(true);
       window.scrollTo({ top: 0, behavior: "smooth" });
@@ -83,38 +101,48 @@ export default function MemberPage({ params }) {
     return () => clearTimeout(t);
   }, [popup]);
 
-  const totalTasks = slots.reduce((n, s) => n + s.tasks.filter((t) => t.trim()).length, 0);
-  const filledSlots = slots.filter((s) => s.tasks.some((t) => t.trim())).length;
-  const blockages = slots.filter((s) => s.blockage.trim()).length;
+  const workSlots = slots.filter((s) => !LUNCH_IDS.has(s.id));
+  const totalTasks = workSlots.reduce((n, s) => n + s.tasks.filter((t) => t.trim()).length, 0);
+  const filledSlots = workSlots.filter((s) => s.tasks.some((t) => t.trim())).length;
+  const blockages = workSlots.filter((s) => s.blockage.trim()).length;
+  const isToday = date === todayStr();
 
   return (
     <>
-      <p className="note" style={{ marginBottom: 8 }}>
-        <Link href="/">&larr; Back to Dashboard</Link>
-      </p>
-      <h1>{member ? member.name : "Loading..."}</h1>
-      <p className="sub">{member?.role || "Team Member"} &middot; Daily slot-wise work sheet</p>
+      <Link href="/" className="back">&larr; Back to dashboard</Link>
 
       <div className="card">
-        <div className="row">
-          <div style={{ maxWidth: 220 }}>
-            <label>Report Date</label>
-            <input type="date" value={date} onChange={(e) => setDate(e.target.value)} />
+        <div className="profile">
+          <div className="profile-id">
+            <div className="avatar lg" style={{ background: avatarColor(member?.name || "") }}>
+              {member ? initials(member.name) : ""}
+            </div>
+            <div style={{ minWidth: 0 }}>
+              <h1>{member ? member.name : "Loading…"}</h1>
+              <div className="sub">{member?.role || "Team Member"}</div>
+            </div>
           </div>
-          <div style={{ flex: 1 }}>
-            <p className="note" style={{ margin: 0 }}>
-              Showing sheet for <strong>{prettyDate(date)}</strong>. Har date ka sheet alag save hota hai &mdash;
-              kal ka form apne aap khaali milega.
-            </p>
+          <div className="field date-field">
+            <label htmlFor="sheet-date">Sheet date</label>
+            <input id="sheet-date" type="date" value={date} onChange={(e) => e.target.value && setDate(e.target.value)} />
           </div>
+        </div>
+        <div className="hint">
+          <span aria-hidden="true">📅</span>
+          <span>
+            Showing the sheet for <strong>{prettyDate(date)}</strong>
+            {isToday && <span className="badge ok" style={{ marginLeft: 8 }}>Today</span>}
+            <br />
+            Each date is saved separately &mdash; tomorrow opens as a fresh, empty sheet.
+          </span>
         </div>
       </div>
 
       {loading ? (
-        <div className="card empty">Loading sheet...</div>
+        <div className="card empty">Loading sheet&hellip;</div>
       ) : submitted ? (
         <div className="card done-card">
-          <div className="tick">&#10003;</div>
+          <div className="tick"><Check /></div>
           <h2>Sheet submitted for {prettyDate(date)}</h2>
           <p className="note">Your entry is saved in the team database.</p>
           <div className="summary">
@@ -124,35 +152,56 @@ export default function MemberPage({ params }) {
             <div><div className="big">{extraHours || "0"}</div><div className="lbl">Extra hours</div></div>
           </div>
           <div className="btnrow">
-            <button className="btn-ghost" onClick={() => setSubmitted(false)}>Edit this sheet</button>
-            <Link href="/" className="btn">Back to Dashboard</Link>
+            <button type="button" className="btn btn-ghost" onClick={() => setSubmitted(false)}>Edit this sheet</button>
+            <Link href="/" className="btn">Back to dashboard</Link>
           </div>
         </div>
       ) : (
         <>
           {SLOTS.map((s) => {
+            if (s.lunch) {
+              return (
+                <div key={s.id} className="lunch-banner" role="note">
+                  <div className="lunch-icon" aria-hidden="true">🍽️</div>
+                  <div>
+                    <div className="lunch-title">Lunch Break</div>
+                    <div className="lunch-sub">Relax &mdash; no entry needed for this slot</div>
+                  </div>
+                  <div className="lunch-time">{s.label}</div>
+                </div>
+              );
+            }
+
             const v = slots.find((x) => x.id === s.id);
             if (!v) return null;
+            const n = WORK_NO[s.id];
+            const filled = v.tasks.filter((t) => t.trim()).length;
             return (
-              <div key={s.id} className={`slot${s.lunch ? " lunch" : ""}`}>
+              <div key={s.id} className="slot">
                 <div className="slot-head">
-                  <span>{s.label}</span>
-                  <span className={`pill${s.lunch ? " lunchpill" : ""}`}>{s.lunch ? "Break" : "Work Slot"}</span>
+                  <div className="slot-title">
+                    <span className="slot-no">Slot {n}</span>
+                    <span className="slot-time">{s.label}</span>
+                  </div>
+                  <span className={filled ? "slot-count done" : "slot-count"}>
+                    {filled}/{v.tasks.length} filled
+                  </span>
                 </div>
                 <div className="slot-body">
                   {v.tasks.map((t, i) => (
                     <div className="taskline" key={i}>
-                      <div style={{ flex: 1, minWidth: 0 }}>
-                        <label>Task {i + 1}</label>
-                        <input
-                          value={t}
-                          onChange={(e) => setTask(s.id, i, e.target.value)}
-                          placeholder={i === 0 ? "What did you work on?" : "Another task in this slot"}
-                        />
-                      </div>
-                      {v.tasks.length > MIN_TASKS && (
+                      <span className="task-num" aria-hidden="true">{i + 1}</span>
+                      <input
+                        value={t}
+                        aria-label={`Slot ${n}, task ${i + 1}`}
+                        onChange={(e) => setTask(s.id, i, e.target.value)}
+                        placeholder={i === 0 ? "What did you work on?" : "Another task in this slot"}
+                      />
+                      {v.tasks.length > MIN_TASKS ? (
                         <button type="button" className="x-btn" title="Remove this task"
-                          onClick={() => removeTask(s.id, i)}>&times;</button>
+                          aria-label={`Remove task ${i + 1}`} onClick={() => removeTask(s.id, i)}>&times;</button>
+                      ) : (
+                        <span className="x-space" aria-hidden="true" />
                       )}
                     </div>
                   ))}
@@ -161,10 +210,14 @@ export default function MemberPage({ params }) {
                     + Add task
                   </button>
 
-                  <div>
-                    <label>Blockage / Reason (if work not done)</label>
-                    <input value={v.blockage} onChange={(e) => setBlockage(s.id, e.target.value)}
-                      placeholder="Kaam nahi hua to kya wajah thi?" />
+                  <div className="blockage">
+                    <label htmlFor={`block-${s.id}`}>Blockage / reason (if work wasn&apos;t done)</label>
+                    <input
+                      id={`block-${s.id}`}
+                      value={v.blockage}
+                      onChange={(e) => setBlockage(s.id, e.target.value)}
+                      placeholder="Kaam nahi hua to kya wajah thi?"
+                    />
                   </div>
                 </div>
               </div>
@@ -172,27 +225,32 @@ export default function MemberPage({ params }) {
           })}
 
           <div className="card">
-            <h2>Extra Work</h2>
-            <div className="row">
-              <div style={{ maxWidth: 200, flex: "0 0 200px" }}>
-                <label>Extra Work Hours</label>
-                <input type="number" min="0" step="0.5" value={extraHours}
+            <div className="card-head" style={{ marginBottom: 14 }}>
+              <div>
+                <h2>Extra work</h2>
+                <div className="card-sub">Worked beyond 6:30? Log it here.</div>
+              </div>
+            </div>
+            <div className="field-row">
+              <div className="field narrow">
+                <label htmlFor="xh">Extra hours</label>
+                <input id="xh" type="number" inputMode="decimal" min="0" step="0.5" value={extraHours}
                   onChange={(e) => setExtraHours(e.target.value)} placeholder="e.g. 1.5" />
               </div>
-              <div>
-                <label>Kya extra work kiya</label>
-                <input value={extraWork} onChange={(e) => setExtraWork(e.target.value)}
+              <div className="field">
+                <label htmlFor="xw">What extra work did you do?</label>
+                <input id="xw" value={extraWork} onChange={(e) => setExtraWork(e.target.value)}
                   placeholder="Describe the extra work done" />
               </div>
             </div>
           </div>
 
-          <div className="card save-bar">
-            <span className="note" style={{ color: error ? "var(--danger)" : "var(--muted)" }}>
-              {error || "Sheet save hone ke baad form band ho jayega."}
+          <div className="save-bar">
+            <span className={error ? "err" : "note"}>
+              {error || `${totalTasks} task${totalTasks === 1 ? "" : "s"} across ${filledSlots} slot${filledSlots === 1 ? "" : "s"}`}
             </span>
-            <button className="btn-ok" onClick={save} disabled={saving}>
-              {saving ? "Saving..." : `Save Sheet for ${prettyDate(date)}`}
+            <button type="button" className="btn" onClick={save} disabled={saving}>
+              {saving ? "Saving…" : `Save sheet for ${prettyDate(date)}`}
             </button>
           </div>
         </>
@@ -200,13 +258,13 @@ export default function MemberPage({ params }) {
 
       {popup && (
         <div className="overlay" onClick={() => setPopup(false)}>
-          <div className="modal" onClick={(e) => e.stopPropagation()}>
-            <div className="tick">&#10003;</div>
+          <div className="modal" role="dialog" aria-modal="true" onClick={(e) => e.stopPropagation()}>
+            <div className="tick"><Check size={32} /></div>
             <h3>Saved successfully</h3>
             <p>Sheet for <strong>{prettyDate(date)}</strong> has been saved.</p>
             <div className="actions">
-              <button className="btn-ghost" onClick={() => setPopup(false)}>Close</button>
-              <Link href="/" className="btn">Back to Dashboard</Link>
+              <button type="button" className="btn btn-ghost" onClick={() => setPopup(false)}>Close</button>
+              <Link href="/" className="btn">Back to dashboard</Link>
             </div>
           </div>
         </div>

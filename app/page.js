@@ -3,9 +3,21 @@
 import { useEffect, useState } from "react";
 import Link from "next/link";
 import { todayStr, prettyDate } from "@/lib/slots";
+import { initials, avatarColor } from "@/lib/people";
+
+function TrashIcon() {
+  return (
+    <svg viewBox="0 0 24 24" width="17" height="17" aria-hidden="true">
+      <path d="M4 7h16M10 11v6M14 11v6M6 7l1 12a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2l1-12M9 7V4h6v3"
+        fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  );
+}
 
 export default function Home() {
+  const today = todayStr();
   const [members, setMembers] = useState([]);
+  const [doneToday, setDoneToday] = useState(() => new Set());
   const [name, setName] = useState("");
   const [role, setRole] = useState("");
   const [loading, setLoading] = useState(true);
@@ -13,8 +25,12 @@ export default function Home() {
   const [err, setErr] = useState("");
 
   const load = async () => {
-    const r = await fetch("/api/members");
-    setMembers(await r.json());
+    const [m, e] = await Promise.all([
+      fetch("/api/members").then((r) => r.json()),
+      fetch(`/api/report?from=${today}&to=${today}`).then((r) => r.json()),
+    ]);
+    setMembers(Array.isArray(m) ? m : []);
+    setDoneToday(new Set((Array.isArray(e) ? e : []).map((x) => x.memberId)));
     setLoading(false);
   };
 
@@ -40,59 +56,104 @@ export default function Home() {
     load();
   };
 
+  const submitted = members.filter((m) => doneToday.has(m._id)).length;
+
   return (
     <>
-      <h1>Team Dashboard</h1>
-      <p className="sub">Today is {prettyDate(todayStr())}. Open your page and fill the slot-wise task sheet.</p>
+      <div className="page-head">
+        <div>
+          <div className="eyebrow">Team Dashboard</div>
+          <h1>Daily Work Sheets</h1>
+          <p className="sub">Open your name, fill today&apos;s slots and save. Every day starts with a fresh sheet.</p>
+        </div>
+        <span className="chip"><span className="dot" />{prettyDate(today)}</span>
+      </div>
 
-      <div className="card">
-        <h2>Add Team Member</h2>
-        <form onSubmit={addMember} className="row">
-          <div>
-            <label>Full Name</label>
-            <input value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. Deepak Vishwakarma" />
-          </div>
-          <div>
-            <label>Role / Designation</label>
-            <input value={role} onChange={(e) => setRole(e.target.value)} placeholder="e.g. Automation Engineer" />
-          </div>
-          <div style={{ flex: "0 0 auto", minWidth: 0 }}>
-            <button disabled={busy}>{busy ? "Adding..." : "Create Member"}</button>
-          </div>
-        </form>
-        {err && <p className="note" style={{ color: "var(--danger)", marginTop: 10 }}>{err}</p>}
+      <div className="stats">
+        <div className="stat accent">
+          <div className="val">{members.length}</div>
+          <div className="lbl">Team members</div>
+        </div>
+        <div className="stat">
+          <div className="val">{submitted}</div>
+          <div className="lbl">Submitted today</div>
+        </div>
+        <div className="stat">
+          <div className="val">{Math.max(members.length - submitted, 0)}</div>
+          <div className="lbl">Pending today</div>
+        </div>
       </div>
 
       <div className="card">
         <div className="card-head">
-          <h2 style={{ margin: 0 }}>Team Members ({members.length})</h2>
-          <Link href="/reports" className="btn btn-ghost">Weekly Report</Link>
+          <div>
+            <h2>Team members</h2>
+            <div className="card-sub">Tap a name to open the daily sheet</div>
+          </div>
+          <Link href="/reports" className="btn btn-ghost btn-sm">View reports</Link>
         </div>
 
         {loading ? (
-          <div className="empty">Loading...</div>
+          <div className="empty">Loading team&hellip;</div>
         ) : members.length === 0 ? (
-          <div className="empty">No members yet. Add your 5 team members above.</div>
+          <div className="empty">
+            <div className="empty-icon">👥</div>
+            No members yet. Add your team below.
+          </div>
         ) : (
           <div className="grid">
-            {members.map((m) => (
-              <div key={m._id} className="member">
-                <Link href={`/member/${m._id}`}>
-                  <div className="avatar">{m.name.charAt(0).toUpperCase()}</div>
-                  <div className="name">{m.name}</div>
-                  <div className="role">{m.role || "Team Member"}</div>
-                </Link>
-                <button
-                  className="btn-ghost"
-                  style={{ marginTop: 12, padding: "5px 10px", fontSize: 12, color: "var(--danger)" }}
-                  onClick={() => removeMember(m)}
-                >
-                  Remove
-                </button>
-              </div>
-            ))}
+            {members.map((m) => {
+              const done = doneToday.has(m._id);
+              return (
+                <div key={m._id} className="mcard">
+                  <Link href={`/member/${m._id}`} className="mcard-main">
+                    <div className="avatar" style={{ background: avatarColor(m.name) }}>{initials(m.name)}</div>
+                    <div className="mcard-info">
+                      <div className="name">{m.name}</div>
+                      <div className="role">{m.role || "Team Member"}</div>
+                    </div>
+                  </Link>
+                  <div className="mcard-foot">
+                    <span className={done ? "badge ok" : "badge wait"}>{done ? "Submitted" : "Pending"}</span>
+                    <div className="btnrow">
+                      <button
+                        type="button"
+                        className="btn btn-icon"
+                        title={`Remove ${m.name}`}
+                        aria-label={`Remove ${m.name}`}
+                        onClick={() => removeMember(m)}
+                      >
+                        <TrashIcon />
+                      </button>
+                      <Link href={`/member/${m._id}`} className="btn btn-soft btn-sm">Open sheet &rarr;</Link>
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
           </div>
         )}
+      </div>
+
+      <div className="card">
+        <div className="card-head">
+          <div>
+            <h2>Add team member</h2>
+            <div className="card-sub">Each member gets their own daily sheet page</div>
+          </div>
+        </div>
+        <form onSubmit={addMember} className="form-grid">
+          <div>
+            <label htmlFor="m-name">Full name</label>
+            <input id="m-name" value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. Deepak Vishwakarma" />
+          </div>
+          <div>
+            <label htmlFor="m-role">Role / designation</label>
+            <input id="m-role" value={role} onChange={(e) => setRole(e.target.value)} placeholder="e.g. Automation Engineer" />
+          </div>
+          <button className="btn" disabled={busy || !name.trim()}>{busy ? "Adding…" : "+ Add member"}</button>
+        </form>
+        {err && <p className="err" style={{ marginTop: 10 }}>{err}</p>}
       </div>
     </>
   );

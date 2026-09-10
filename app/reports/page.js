@@ -1,41 +1,11 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import { SLOTS, todayStr, prettyDate, weekRange, normalizeEntrySlots, meaningfulSlots } from "@/lib/slots";
+import { todayStr, prettyDate, weekRange, shiftDate } from "@/lib/slots";
+import { initials, avatarColor } from "@/lib/people";
+import { FULL_HEAD, SOLO_HEAD, toRows, reportStats, buildWorkbook, buildReportPdf } from "@/lib/report";
 
-const FULL_HEAD = ["Date", "Member", "Time Slot", "Tasks", "Blockage / Reason", "Extra Hours", "Extra Work"];
-const FULL_WIDTHS = [14, 20, 22, 48, 34, 12, 34];
-// Per-member exports drop the redundant "Member" column.
-const SOLO_HEAD = FULL_HEAD.filter((h) => h !== "Member");
-const SOLO_WIDTHS = FULL_WIDTHS.filter((_, i) => FULL_HEAD[i] !== "Member");
-
-const slotLabel = (id) => SLOTS.find((s) => s.id === id)?.label || id;
-
-// One row per slot that actually has content. Empty slots are skipped so the
-// report stays short instead of carrying five blank lines per person per day.
-function toRows(entries, { withMember = true } = {}) {
-  const rows = [];
-  for (const e of entries) {
-    const slots = meaningfulSlots(normalizeEntrySlots(e.slots));
-    if (!slots.length && !e.extraHours && !e.extraWork) continue;
-    const extras = [String(e.extraHours || ""), e.extraWork || ""];
-    if (!slots.length) {
-      rows.push([prettyDate(e.date), ...(withMember ? [e.memberName || "-"] : []), "-", "", "", ...extras]);
-      continue;
-    }
-    slots.forEach((s, i) => {
-      rows.push([
-        prettyDate(e.date),
-        ...(withMember ? [e.memberName || "-"] : []),
-        slotLabel(s.id),
-        s.tasks.map((t, n) => `${n + 1}. ${t}`).join("\n"),
-        s.blockage || "",
-        ...(i === 0 ? extras : ["", ""]),
-      ]);
-    });
-  }
-  return rows;
-}
+const XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
 
 function download(blob, filename) {
   const url = URL.createObjectURL(blob);
@@ -46,7 +16,48 @@ function download(blob, filename) {
   URL.revokeObjectURL(url);
 }
 
-const safe = (s) => (s || "report").replace(/[\\/:*?"<>|[\]]/g, "-").slice(0, 28);
+const safeFile = (s) => (s || "report").replace(/[\\/:*?"<>|[\]]/g, "-").trim();
+
+const metaFor = (s) => [
+  ["Day-sheets", s.sheets],
+  ["Tasks", s.tasks],
+  ["Blockages", s.blockages],
+  ["Extra hours", s.extraHours],
+];
+
+function ReportTable({ head, rows }) {
+  return (
+    <div className="tablewrap">
+      <table className="rtable">
+        <thead>
+          <tr>{head.map((h) => <th key={h}>{h}</th>)}</tr>
+        </thead>
+        <tbody>
+          {rows.map((r, i) => (
+            <tr key={i}>
+              {r.map((c, j) => {
+                const h = head[j];
+                const cls = [
+                  c ? "" : "is-empty",
+                  j === 0 ? "first" : "",
+                  h === "Tasks" ? "pre" : "",
+                  h === "Time Slot" || h === "Extra Hours" ? "nowrap" : "",
+                  h === "Date" || h === "Member" ? "strong" : "",
+                  h === "Blockage / Reason" && c ? "warn" : "",
+                ].filter(Boolean).join(" ");
+                return (
+                  <td key={j} data-label={h} className={cls}>
+                    {c || <span className="dash">&mdash;</span>}
+                  </td>
+                );
+              })}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
 
 export default function Reports() {
   const init = weekRange(todayStr());
@@ -56,226 +67,218 @@ export default function Reports() {
   const [loading, setLoading] = useState(false);
   const [msg, setMsg] = useState("");
   const [view, setView] = useState("merged"); // merged | byname
-  const [open, setOpen] = useState({});
+  const [closed, setClosed] = useState(() => new Set());
+  const [busy, setBusy] = useState("");
 
   const load = async (f = from, t = to) => {
     setLoading(true); setMsg("");
-    const r = await fetch(`/api/report?from=${f}&to=${t}`);
-    setEntries(await r.json());
-    setLoading(false);
+    try {
+      const r = await fetch(`/api/report?from=${f}&to=${t}`);
+      const d = await r.json();
+      setEntries(Array.isArray(d) ? d : []);
+    } finally {
+      setLoading(false);
+    }
   };
 
   useEffect(() => { load(init.from, init.to); }, []);
 
-  const thisWeek = () => {
-    const w = weekRange(todayStr());
+  const pickWeek = (offset) => {
+    const w = weekRange(shiftDate(todayStr(), offset * 7));
     setFrom(w.from); setTo(w.to); load(w.from, w.to);
   };
 
-  // Group once, reuse for both the on-screen view and every export.
+  // Group once by member; reused by the on-screen view and every export.
   const groups = useMemo(() => {
     const map = new Map();
     for (const e of entries) {
-      const key = e.memberName || "Unnamed";
-      if (!map.has(key)) map.set(key, []);
-      map.get(key).push(e);
+      const key = e.memberId || e.memberName || "unknown";
+      if (!map.has(key)) map.set(key, { id: key, name: e.memberName || "Unnamed", items: [] });
+      map.get(key).items.push(e);
     }
-    return [...map.entries()]
-      .sort((a, b) => a[0].localeCompare(b[0]))
-      .map(([name, items]) => ({ name, items, rows: toRows(items, { withMember: false }) }));
+    return [...map.values()]
+      .sort((a, b) => a.name.localeCompare(b.name))
+      .map((g) => ({ ...g, rows: toRows(g.items, { withMember: false }), stats: reportStats(g.items) }));
   }, [entries]);
 
   const mergedRows = useMemo(() => toRows(entries), [entries]);
+  const stats = useMemo(() => reportStats(entries), [entries]);
 
-  const styleSheet = (ws, head, widths) => {
-    ws.columns = head.map((h, i) => ({ header: h, width: widths[i] }));
-    const header = ws.getRow(1);
-    header.font = { bold: true, color: { argb: "FFFFFFFF" } };
-    header.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF2563EB" } };
-    ws.views = [{ state: "frozen", ySplit: 1 }];
-    ws.autoFilter = { from: "A1", to: { row: 1, column: head.length } };
-  };
-
-  const fillSheet = (ws, head, widths, rows) => {
-    styleSheet(ws, head, widths);
-    rows.forEach((r) => ws.addRow(r));
-    ws.eachRow((row, n) => {
-      if (n > 1) row.alignment = { vertical: "top", wrapText: true };
-    });
-  };
-
-  // sheets: [{ name, head, widths, rows }]
-  const writeWorkbook = async (sheets, filename) => {
-    const ExcelJS = (await import("exceljs")).default;
-    const wb = new ExcelJS.Workbook();
-    sheets.forEach((s) => fillSheet(wb.addWorksheet(s.name), s.head, s.widths, s.rows));
-    const buf = await wb.xlsx.writeBuffer();
-    download(
-      new Blob([buf], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" }),
-      filename
-    );
-  };
-
-  // sections: [{ title, head, rows }]
-  const writePdf = async (sections, filename) => {
-    const { jsPDF } = await import("jspdf");
-    const { autoTable } = await import("jspdf-autotable");
-    const doc = new jsPDF({ orientation: "landscape" });
-    sections.forEach((sec, i) => {
-      if (i > 0) doc.addPage();
-      doc.setFontSize(14);
-      doc.text(sec.title, 14, 14);
-      doc.setFontSize(10);
-      doc.text(`${prettyDate(from)}  to  ${prettyDate(to)}`, 14, 21);
-      autoTable(doc, {
-        head: [sec.head],
-        body: sec.rows,
-        startY: 26,
-        styles: { fontSize: 8, cellPadding: 2, overflow: "linebreak", valign: "top" },
-        headStyles: { fillColor: [37, 99, 235] },
-        columnStyles: { 0: { cellWidth: 22 } },
-      });
-    });
-    doc.save(filename);
-  };
-
+  const rangeText = `${prettyDate(from)} to ${prettyDate(to)}`;
   const stamp = `${from}_to_${to}`;
+
+  const run = async (key, fn) => {
+    setBusy(key); setMsg("");
+    try { await fn(); }
+    catch (e) { console.error(e); setMsg(`Export failed: ${e.message}`); }
+    finally { setBusy(""); }
+  };
+
+  const excel = (key, sheets, filename) => run(key, async () => {
+    const ExcelJS = (await import("exceljs")).default;
+    const buf = await buildWorkbook(ExcelJS, sheets);
+    download(new Blob([buf], { type: XLSX_MIME }), filename);
+  });
+
+  const pdf = (key, sections, filename) => run(key, async () => {
+    const [{ jsPDF }, { autoTable }] = await Promise.all([import("jspdf"), import("jspdf-autotable")]);
+    const generatedAt = new Date().toLocaleString("en-IN", {
+      day: "numeric", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit",
+    });
+    buildReportPdf({ jsPDF, autoTable, sections, rangeText, generatedAt }).save(filename);
+  });
 
   const exportExcel = () =>
     view === "byname"
-      ? writeWorkbook(
-          groups.map((g) => ({ name: safe(g.name).slice(0, 31), head: SOLO_HEAD, widths: SOLO_WIDTHS, rows: g.rows })),
-          `Team-Report_by-name_${stamp}.xlsx`
-        )
-      : writeWorkbook(
-          [{ name: "Team Report", head: FULL_HEAD, widths: FULL_WIDTHS, rows: mergedRows }],
-          `Team-Report_${stamp}.xlsx`
-        );
+      ? excel("all-xlsx", groups.map((g) => ({ name: g.name, head: SOLO_HEAD, rows: g.rows })),
+          `Team-Report_by-name_${stamp}.xlsx`)
+      : excel("all-xlsx", [{ name: "Team Report", head: FULL_HEAD, rows: mergedRows }],
+          `Team-Report_${stamp}.xlsx`);
 
   const exportPdf = () =>
     view === "byname"
-      ? writePdf(
-          groups.map((g) => ({ title: `${g.name} — Work Report`, head: SOLO_HEAD, rows: g.rows })),
-          `Team-Report_by-name_${stamp}.pdf`
-        )
-      : writePdf(
-          [{ title: "Team Weekly Work Report", head: FULL_HEAD, rows: mergedRows }],
-          `Team-Report_${stamp}.pdf`
-        );
+      ? pdf("all-pdf", groups.map((g) => ({
+          title: `${g.name} - Work Report`, head: SOLO_HEAD, rows: g.rows, meta: metaFor(g.stats),
+        })), `Team-Report_by-name_${stamp}.pdf`)
+      : pdf("all-pdf", [{
+          title: "Team Work Report", head: FULL_HEAD, rows: mergedRows,
+          meta: [["Members", groups.length], ...metaFor(stats)],
+        }], `Team-Report_${stamp}.pdf`);
 
   const memberExcel = (g) =>
-    writeWorkbook(
-      [{ name: safe(g.name).slice(0, 31), head: SOLO_HEAD, widths: SOLO_WIDTHS, rows: g.rows }],
-      `${safe(g.name)}_${stamp}.xlsx`
-    );
+    excel(`${g.id}-xlsx`, [{ name: g.name, head: SOLO_HEAD, rows: g.rows }], `${safeFile(g.name)}_${stamp}.xlsx`);
 
   const memberPdf = (g) =>
-    writePdf([{ title: `${g.name} — Work Report`, head: SOLO_HEAD, rows: g.rows }], `${safe(g.name)}_${stamp}.pdf`);
+    pdf(`${g.id}-pdf`, [{ title: `${g.name} - Work Report`, head: SOLO_HEAD, rows: g.rows, meta: metaFor(g.stats) }],
+      `${safeFile(g.name)}_${stamp}.pdf`);
+
+  const toggle = (gid) =>
+    setClosed((prev) => {
+      const next = new Set(prev);
+      next.has(gid) ? next.delete(gid) : next.add(gid);
+      return next;
+    });
 
   const wipe = async () => {
-    if (!confirm(`Delete ALL entries from ${prettyDate(from)} to ${prettyDate(to)}? Export first — this cannot be undone.`)) return;
+    if (!confirm(`Delete ALL entries from ${rangeText}? Export first — this cannot be undone.`)) return;
     const r = await fetch(`/api/report?from=${from}&to=${to}`, { method: "DELETE" });
     const d = await r.json();
+    await load();
     setMsg(`${d.deleted} entries deleted. Database cleaned up.`);
-    load();
   };
 
-  const Cell = ({ v }) =>
-    v ? <span style={{ whiteSpace: "pre-line" }}>{v}</span> : <span style={{ color: "#c3cad6" }}>&mdash;</span>;
-
-  const Table = ({ head, rows }) => (
-    <div className="tablewrap">
-      <table>
-        <thead><tr>{head.map((h) => <th key={h}>{h}</th>)}</tr></thead>
-        <tbody>
-          {rows.map((r, i) => (
-            <tr key={i}>{r.map((c, j) => <td key={j}><Cell v={c} /></td>)}</tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
-  );
+  const none = !entries.length;
 
   return (
     <>
-      <h1>Reports &amp; Export</h1>
-      <p className="sub">Pick a date range, view merged or name-wise, export to Excel or PDF, then clear old data to keep the free database light.</p>
-
-      <div className="card">
-        <div className="row">
-          <div style={{ maxWidth: 190 }}>
-            <label>From</label>
-            <input type="date" value={from} onChange={(e) => setFrom(e.target.value)} />
-          </div>
-          <div style={{ maxWidth: 190 }}>
-            <label>To</label>
-            <input type="date" value={to} onChange={(e) => setTo(e.target.value)} />
-          </div>
-          <div className="btnrow" style={{ flex: "0 0 auto" }}>
-            <button onClick={() => load()}>Load Report</button>
-            <button className="btn-ghost" onClick={thisWeek}>This Week</button>
-          </div>
+      <div className="page-head">
+        <div>
+          <div className="eyebrow">Reports &amp; Export</div>
+          <h1>Weekly Team Report</h1>
+          <p className="sub">Pick a range, review merged or name-wise, export to Excel or PDF, then clear old data to keep the database light.</p>
         </div>
       </div>
 
       <div className="card">
-        <div className="card-head">
-          <div>
-            <h2 style={{ margin: 0 }}>
-              {entries.length} day-sheets &middot; {groups.length} members &middot; {mergedRows.length} rows
-            </h2>
-            <span className="note">{prettyDate(from)} to {prettyDate(to)}</span>
+        <div className="field-row">
+          <div className="field narrow">
+            <label htmlFor="r-from">From</label>
+            <input id="r-from" type="date" value={from} onChange={(e) => setFrom(e.target.value)} />
           </div>
-          <div className="tabs">
-            <button className={view === "merged" ? "tab on" : "tab"} onClick={() => setView("merged")}>Merged</button>
-            <button className={view === "byname" ? "tab on" : "tab"} onClick={() => setView("byname")}>Name-wise</button>
+          <div className="field narrow">
+            <label htmlFor="r-to">To</label>
+            <input id="r-to" type="date" value={to} onChange={(e) => setTo(e.target.value)} />
+          </div>
+          <div className="btnrow">
+            <button type="button" className="btn" onClick={() => load()}>Load report</button>
+            <button type="button" className="btn btn-ghost" onClick={() => pickWeek(0)}>This week</button>
+            <button type="button" className="btn btn-ghost" onClick={() => pickWeek(-1)}>Last week</button>
+          </div>
+        </div>
+      </div>
+
+      <div className="stats five">
+        <div className="stat accent"><div className="val">{stats.sheets}</div><div className="lbl">Day-sheets</div></div>
+        <div className="stat"><div className="val">{groups.length}</div><div className="lbl">Members</div></div>
+        <div className="stat"><div className="val">{stats.tasks}</div><div className="lbl">Tasks logged</div></div>
+        <div className="stat"><div className="val">{stats.blockages}</div><div className="lbl">Blockages</div></div>
+        <div className="stat"><div className="val">{stats.extraHours}</div><div className="lbl">Extra hours</div></div>
+      </div>
+
+      <div className="card">
+        <div className="toolbar">
+          <div className="tabs" role="tablist" aria-label="Report view">
+            <button type="button" role="tab" aria-selected={view === "merged"}
+              className={view === "merged" ? "tab on" : "tab"} onClick={() => setView("merged")}>Merged</button>
+            <button type="button" role="tab" aria-selected={view === "byname"}
+              className={view === "byname" ? "tab on" : "tab"} onClick={() => setView("byname")}>Name-wise</button>
+          </div>
+          <div className="btnrow">
+            <button type="button" className="btn" onClick={exportExcel} disabled={none || !!busy}>
+              {busy === "all-xlsx" ? "Preparing…" : "Export Excel"}
+            </button>
+            <button type="button" className="btn btn-soft" onClick={exportPdf} disabled={none || !!busy}>
+              {busy === "all-pdf" ? "Preparing…" : "Export PDF"}
+            </button>
+            <button type="button" className="btn btn-danger" onClick={wipe} disabled={none || !!busy}>
+              Delete range
+            </button>
           </div>
         </div>
 
-        <div className="btnrow">
-          <button className="btn-ok" onClick={exportExcel} disabled={!entries.length}>
-            Export Excel{view === "byname" ? " (sheet per member)" : ""}
-          </button>
-          <button onClick={exportPdf} disabled={!entries.length}>
-            Export PDF{view === "byname" ? " (page per member)" : ""}
-          </button>
-          <button className="btn-danger" onClick={wipe} disabled={!entries.length}>Delete This Range</button>
+        <div className="note" style={{ marginBottom: 14 }}>
+          {rangeText} &middot; {view === "byname"
+            ? "Exports get one sheet / page per member"
+            : "All members in one table"}
         </div>
 
-        {msg && <p className="saved" style={{ marginTop: 12 }}>{msg}</p>}
+        {msg && <p className={msg.startsWith("Export failed") ? "err" : "okmsg"} style={{ margin: "0 0 14px" }}>{msg}</p>}
 
-        <div style={{ marginTop: 16 }}>
-          {loading ? (
-            <div className="empty">Loading...</div>
-          ) : !entries.length ? (
-            <div className="empty">No entries found in this range.</div>
-          ) : view === "merged" ? (
-            <Table head={FULL_HEAD} rows={mergedRows} />
-          ) : (
-            groups.map((g) => {
-              const isOpen = open[g.name] !== false;
-              return (
-                <div className="person" key={g.name}>
-                  <div className="person-head">
-                    <button
-                      className="person-toggle"
-                      onClick={() => setOpen((o) => ({ ...o, [g.name]: !isOpen }))}
-                    >
-                      <span className="caret">{isOpen ? "▾" : "▸"}</span>
+        {loading ? (
+          <div className="empty">Loading&hellip;</div>
+        ) : none ? (
+          <div className="empty">
+            <div className="empty-icon">📄</div>
+            No entries found in this range.
+          </div>
+        ) : view === "merged" ? (
+          mergedRows.length ? <ReportTable head={FULL_HEAD} rows={mergedRows} /> : <div className="empty">Sheets were saved but have no tasks yet.</div>
+        ) : (
+          groups.map((g) => {
+            const isOpen = !closed.has(g.id);
+            return (
+              <div className={isOpen ? "person open" : "person"} key={g.id}>
+                <div className="person-head">
+                  <button type="button" className="person-toggle" aria-expanded={isOpen} onClick={() => toggle(g.id)}>
+                    <span className="caret" aria-hidden="true">&#9656;</span>
+                    <span className="avatar" style={{ background: avatarColor(g.name) }}>{initials(g.name)}</span>
+                    <span style={{ minWidth: 0 }}>
                       <span className="pname">{g.name}</span>
-                      <span className="note">{g.items.length} days &middot; {g.rows.length} rows</span>
+                      <span className="pmeta">
+                        {g.stats.sheets} days &middot; {g.stats.tasks} tasks &middot; {g.stats.blockages} blockages &middot; {g.stats.extraHours} extra hrs
+                      </span>
+                    </span>
+                  </button>
+                  <div className="btnrow">
+                    <button type="button" className="btn btn-sm" onClick={() => memberExcel(g)} disabled={!!busy}>
+                      {busy === `${g.id}-xlsx` ? "Preparing…" : "Excel"}
                     </button>
-                    <div className="btnrow">
-                      <button className="btn-ok small" onClick={() => memberExcel(g)}>Excel</button>
-                      <button className="small" onClick={() => memberPdf(g)}>PDF</button>
-                    </div>
+                    <button type="button" className="btn btn-soft btn-sm" onClick={() => memberPdf(g)} disabled={!!busy}>
+                      {busy === `${g.id}-pdf` ? "Preparing…" : "PDF"}
+                    </button>
                   </div>
-                  {isOpen && <Table head={SOLO_HEAD} rows={g.rows} />}
                 </div>
-              );
-            })
-          )}
-        </div>
+                {isOpen && (
+                  <div className="person-body">
+                    {g.rows.length
+                      ? <ReportTable head={SOLO_HEAD} rows={g.rows} />
+                      : <div className="empty">No task entries.</div>}
+                  </div>
+                )}
+              </div>
+            );
+          })
+        )}
       </div>
     </>
   );
